@@ -1,0 +1,144 @@
+# Install required packages
+!pip install openai pinecone-client langchain sentence-transformers
+
+import os
+import openai
+import pinecone
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Pinecone
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.document_loaders import TextLoader
+import pandas as pd
+from typing import List, Dict
+from sentence_transformers import SentenceTransformer
+
+# Initialize API keys and configurations
+OPENAI_API_KEY = "your-openai-api-key"
+PINECONE_API_KEY = "your-pinecone-api-key"
+PINECONE_ENV = "your-pinecone-environment"
+
+class RAGQABot:
+    def __init__(self):
+        # Initialize OpenAI
+        openai.api_key = OPENAI_API_KEY
+        
+        # Initialize Pinecone
+        pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
+        self.index_name = "qa-index"
+        
+        # Create index if it doesn't exist
+        if self.index_name not in pinecone.list_indexes():
+            pinecone.create_index(
+                name=self.index_name,
+                dimension=1536,  # OpenAI embeddings dimension
+                metric="cosine"
+            )
+        
+        self.index = pinecone.Index(self.index_name)
+        self.embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        self.text_splitter = CharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        
+    def process_documents(self, documents: List[str]) -> None:
+        """
+        Process and index documents into Pinecone
+        """
+        # Split documents into chunks
+        doc_chunks = []
+        for doc in documents:
+            chunks = self.text_splitter.split_text(doc)
+            doc_chunks.extend(chunks)
+        
+        # Create embeddings and index them
+        embeddings = self.embeddings.embed_documents(doc_chunks)
+        
+        # Prepare vectors for Pinecone
+        vectors = []
+        for i, (chunk, embedding) in enumerate(zip(doc_chunks, embeddings)):
+            vectors.append({
+                'id': f'chunk_{i}',
+                'values': embedding,
+                'metadata': {'text': chunk}
+            })
+        
+        # Upload to Pinecone in batches
+        batch_size = 100
+        for i in range(0, len(vectors), batch_size):
+            batch = vectors[i:i + batch_size]
+            self.index.upsert(vectors=batch)
+            
+    def query(self, question: str, top_k: int = 3) -> str:
+        """
+        Query the RAG system with a question
+        """
+        # Get question embedding
+        question_embedding = self.embeddings.embed_query(question)
+        
+        # Query Pinecone
+        results = self.index.query(
+            vector=question_embedding,
+            top_k=top_k,
+            include_metadata=True
+        )
+        
+        # Prepare context from retrieved documents
+        context = "\n".join([r['metadata']['text'] for r in results['matches']])
+        
+        # Prepare prompt for OpenAI
+        prompt = f"""
+        Context: {context}
+        
+        Question: {question}
+        
+        Please answer the question based on the context provided. If the answer cannot be found in the context, say "I cannot answer this question based on the provided context."
+        
+        Answer:"""
+        
+        # Get response from OpenAI
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful QA assistant that answers questions based on the provided context."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        return response.choices[0].message['content']
+
+# Example usage
+def main():
+    # Initialize the RAG QA Bot
+    qa_bot = RAGQABot()
+    
+    # Example documents (replace with your business documents)
+    sample_documents = [
+        """Our company was founded in 2010 and specializes in AI solutions.
+        We offer various services including machine learning consulting,
+        data analysis, and custom AI development.""",
+        
+        """Our pricing structure is based on project complexity.
+        Basic packages start at $1000/month.
+        Enterprise solutions are customized based on client needs."""
+    ]
+    
+    # Process documents
+    qa_bot.process_documents(sample_documents)
+    
+    # Example questions
+    questions = [
+        "When was the company founded?",
+        "What services do you offer?",
+        "What is the pricing for enterprise solutions?"
+    ]
+    
+    # Test the QA system
+    for question in questions:
+        answer = qa_bot.query(question)
+        print(f"\nQuestion: {question}")
+        print(f"Answer: {answer}\n")
+        print("-" * 50)
+
+if __name__ == "__main__":
+    main()
