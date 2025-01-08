@@ -1,144 +1,181 @@
-# Install required packages
-!pip install openai pinecone-client langchain sentence-transformers
+# Import required libraries
+!pip install openai pinecone-client pandas numpy tiktoken
 
 import os
 import openai
 import pinecone
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import Pinecone
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.document_loaders import TextLoader
 import pandas as pd
+import numpy as np
+import tiktoken
 from typing import List, Dict
-from sentence_transformers import SentenceTransformer
-
-# Initialize API keys and configurations
-OPENAI_API_KEY = "your-openai-api-key"
-PINECONE_API_KEY = "your-pinecone-api-key"
-PINECONE_ENV = "your-pinecone-environment"
+from datetime import datetime
 
 class RAGQABot:
-    def __init__(self):
+    def __init__(self, openai_api_key: str, pinecone_api_key: str, pinecone_environment: str, index_name: str):
+        """
+        Initialize the RAG QA Bot with necessary API keys and configurations
+        """
         # Initialize OpenAI
-        openai.api_key = OPENAI_API_KEY
+        openai.api_key = openai_api_key
         
         # Initialize Pinecone
-        pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
-        self.index_name = "qa-index"
+        pinecone.init(api_key=pinecone_api_key, environment=pinecone_environment)
         
-        # Create index if it doesn't exist
-        if self.index_name not in pinecone.list_indexes():
-            pinecone.create_index(
-                name=self.index_name,
-                dimension=1536,  # OpenAI embeddings dimension
-                metric="cosine"
-            )
+        # Create or connect to Pinecone index
+        if index_name not in pinecone.list_indexes():
+            pinecone.create_index(index_name, dimension=1536, metric='cosine')
         
-        self.index = pinecone.Index(self.index_name)
-        self.embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-        self.text_splitter = CharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
+        self.index = pinecone.Index(index_name)
+        self.embedding_model = "text-embedding-ada-002"
+        self.completion_model = "gpt-4-turbo-preview"
+        
+    def get_embedding(self, text: str) -> List[float]:
+        """
+        Get embeddings for the input text using OpenAI's embedding model
+        """
+        response = openai.Embedding.create(
+            input=text,
+            model=self.embedding_model
         )
-        
-    def process_documents(self, documents: List[str]) -> None:
+        return response['data'][0]['embedding']
+    
+    def chunk_text(self, text: str, chunk_size: int = 1000) -> List[str]:
         """
-        Process and index documents into Pinecone
+        Split text into smaller chunks for processing
         """
-        # Split documents into chunks
-        doc_chunks = []
-        for doc in documents:
-            chunks = self.text_splitter.split_text(doc)
-            doc_chunks.extend(chunks)
+        words = text.split()
+        chunks = []
+        current_chunk = []
+        current_size = 0
         
-        # Create embeddings and index them
-        embeddings = self.embeddings.embed_documents(doc_chunks)
-        
-        # Prepare vectors for Pinecone
-        vectors = []
-        for i, (chunk, embedding) in enumerate(zip(doc_chunks, embeddings)):
-            vectors.append({
-                'id': f'chunk_{i}',
-                'values': embedding,
-                'metadata': {'text': chunk}
-            })
-        
-        # Upload to Pinecone in batches
-        batch_size = 100
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
-            self.index.upsert(vectors=batch)
+        for word in words:
+            current_size += len(word) + 1  # +1 for space
+            if current_size > chunk_size:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+                current_size = len(word)
+            else:
+                current_chunk.append(word)
+                
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
             
+        return chunks
+    
+    def upload_documents(self, documents: List[Dict[str, str]]) -> None:
+        """
+        Process and upload documents to Pinecone
+        documents: List of dictionaries with 'text' and 'metadata' keys
+        """
+        vectors_to_upsert = []
+        
+        for doc_idx, doc in enumerate(documents):
+            chunks = self.chunk_text(doc['text'])
+            
+            for chunk_idx, chunk in enumerate(chunks):
+                embedding = self.get_embedding(chunk)
+                
+                metadata = doc.get('metadata', {})
+                metadata.update({
+                    'chunk_idx': chunk_idx,
+                    'doc_idx': doc_idx,
+                    'text': chunk
+                })
+                
+                vector_id = f"doc_{doc_idx}_chunk_{chunk_idx}"
+                vectors_to_upsert.append((vector_id, embedding, metadata))
+                
+                # Batch upsert every 100 vectors
+                if len(vectors_to_upsert) >= 100:
+                    self.index.upsert(vectors=vectors_to_upsert)
+                    vectors_to_upsert = []
+        
+        # Upsert any remaining vectors
+        if vectors_to_upsert:
+            self.index.upsert(vectors=vectors_to_upsert)
+    
     def query(self, question: str, top_k: int = 3) -> str:
         """
-        Query the RAG system with a question
+        Query the RAG system with a question and get an answer
         """
         # Get question embedding
-        question_embedding = self.embeddings.embed_query(question)
+        question_embedding = self.get_embedding(question)
         
-        # Query Pinecone
-        results = self.index.query(
+        # Query Pinecone for similar contexts
+        query_response = self.index.query(
             vector=question_embedding,
             top_k=top_k,
             include_metadata=True
         )
         
-        # Prepare context from retrieved documents
-        context = "\n".join([r['metadata']['text'] for r in results['matches']])
+        # Extract relevant contexts
+        contexts = [match.metadata['text'] for match in query_response.matches]
         
-        # Prepare prompt for OpenAI
-        prompt = f"""
-        Context: {context}
+        # Construct prompt
+        prompt = f"""Answer the question based on the following contexts. If the answer cannot be found in the contexts, say "I cannot answer this question based on the available information."
+
+Contexts:
+{' '.join(contexts)}
+
+Question: {question}
+
+Answer:"""
         
-        Question: {question}
-        
-        Please answer the question based on the context provided. If the answer cannot be found in the context, say "I cannot answer this question based on the provided context."
-        
-        Answer:"""
-        
-        # Get response from OpenAI
+        # Get completion from OpenAI
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+            model=self.completion_model,
             messages=[
-                {"role": "system", "content": "You are a helpful QA assistant that answers questions based on the provided context."},
+                {"role": "system", "content": "You are a helpful assistant that answers questions based on the given context."},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            temperature=0.2
         )
         
-        return response.choices[0].message['content']
+        return response.choices[0].message.content
 
-# Example usage
-def main():
-    # Initialize the RAG QA Bot
-    qa_bot = RAGQABot()
+# Example usage and testing code
+def test_rag_qa_bot():
+    # Initialize the bot (replace with your API keys)
+    bot = RAGQABot(
+        openai_api_key="your_openai_api_key",
+        pinecone_api_key="your_pinecone_api_key",
+        pinecone_environment="your_pinecone_environment",
+        index_name="qa-bot-test"
+    )
     
-    # Example documents (replace with your business documents)
+    # Sample documents
     sample_documents = [
-        """Our company was founded in 2010 and specializes in AI solutions.
-        We offer various services including machine learning consulting,
-        data analysis, and custom AI development.""",
-        
-        """Our pricing structure is based on project complexity.
-        Basic packages start at $1000/month.
-        Enterprise solutions are customized based on client needs."""
+        {
+            "text": """Our company, TechCorp, was founded in 2010. We specialize in developing AI-powered solutions 
+                      for businesses. Our flagship product, AIAssist, helps companies automate their customer service 
+                      operations. We have offices in New York, London, and Singapore.""",
+            "metadata": {"source": "company_profile", "date": "2024-01-01"}
+        },
+        {
+            "text": """TechCorp's AIAssist platform features natural language processing, sentiment analysis, and 
+                      automated response generation. The system can handle multiple languages and integrates with 
+                      popular CRM systems. Pricing starts at $499 per month for basic features.""",
+            "metadata": {"source": "product_documentation", "date": "2024-01-01"}
+        }
     ]
     
-    # Process documents
-    qa_bot.process_documents(sample_documents)
+    # Upload documents
+    print("Uploading documents...")
+    bot.upload_documents(sample_documents)
     
-    # Example questions
-    questions = [
-        "When was the company founded?",
-        "What services do you offer?",
-        "What is the pricing for enterprise solutions?"
+    # Test questions
+    test_questions = [
+        "When was TechCorp founded?",
+        "What are the main features of AIAssist?",
+        "How much does AIAssist cost?",
+        "What is the company's revenue?" # This should return a "cannot answer" response
     ]
     
-    # Test the QA system
-    for question in questions:
-        answer = qa_bot.query(question)
-        print(f"\nQuestion: {question}")
-        print(f"Answer: {answer}\n")
-        print("-" * 50)
+    print("\nTesting questions:")
+    for question in test_questions:
+        print(f"\nQ: {question}")
+        answer = bot.query(question)
+        print(f"A: {answer}")
 
-if __name__ == "__main__":
-    main()
+# To run the test, uncomment the following line:
+# test_rag_qa_bot()
